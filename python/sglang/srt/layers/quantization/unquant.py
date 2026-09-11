@@ -25,6 +25,11 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
+    _XPU_MOE_INTERLEAVED_FUSE_ENABLED,
+    _XPU_MOE_INTERLEAVED_FUSE_MIN_AVG_M,
+    _get_xpu_interleaved_weight,
+)
 from sglang.srt.layers.moe.utils import xpu_moe_ld_padding_elems
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -1195,17 +1200,42 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             if moe_runner_config.apply_router_weight_on_input:
                 x = x * topk_weights.to(x.dtype)
                 topk_weights = torch.ones_like(topk_weights)
+
+            w1 = layer.w13_weight
+            b1 = getattr(layer, "w13_weight_bias", None)
+
+            # Opt-in to sgl-kernel-xpu's single-accumulator interleaved
+            # SwiGLU fusion for GEMM1 (design.md /
+            # docs/moe_interleaved_fusion.md): a net win for prefill-shaped
+            # work (avg tokens/expert >= 32) at plain silu/gelu +
+            # unquantized BF16, a net loss for decode-shaped work, so it's
+            # opt-in via SGLANG_XPU_MOE_INTERLEAVED_FUSE and gated on shape.
+            num_experts = w1.shape[0]
+            avg_m = (x.shape[0] * topk_weights.shape[1]) // max(num_experts, 1)
+            use_interleaved_fuse = (
+                _XPU_MOE_INTERLEAVED_FUSE_ENABLED
+                and avg_m >= _XPU_MOE_INTERLEAVED_FUSE_MIN_AVG_M
+                and moe_runner_config.activation in ("silu", "gelu")
+                and x.dtype == torch.bfloat16
+                and w1.dtype == torch.bfloat16
+            )
+            if use_interleaved_fuse:
+                w1 = _get_xpu_interleaved_weight(w1)
+                if b1 is not None:
+                    b1 = _get_xpu_interleaved_weight(b1)
+
             output = fused_experts(
                 x,
-                layer.w13_weight,
+                w1,
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                b1=getattr(layer, "w13_weight_bias", None),
+                b1=b1,
                 b2=getattr(layer, "w2_weight_bias", None),
                 activation=moe_runner_config.activation,
                 gemm1_alpha=moe_runner_config.gemm1_alpha,
                 gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+                use_interleaved_fuse=use_interleaved_fuse,
             )
             return StandardCombineInput(hidden_states=output)
         else:

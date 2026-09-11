@@ -125,6 +125,34 @@ def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
     return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
 
 
+# Opt-in to sgl-kernel-xpu's single-accumulator interleaved SwiGLU fusion for
+# MoE GEMM1 (see sgl-kernel-xpu/docs/moe_interleaved_fusion.md). It requires
+# w1/b1 to be pre-interleaved via `interleave_gate_up_weights_xe20` and is
+# only a net win for prefill-shaped work (avg tokens/expert >= 32); it
+# regresses for decode, so it defaults to off and is applied per-call based
+# on shape.
+_XPU_MOE_INTERLEAVED_FUSE_ENABLED = get_bool_env_var(
+    "SGLANG_XPU_MOE_INTERLEAVED_FUSE"
+)
+_XPU_MOE_INTERLEAVED_FUSE_MIN_AVG_M = 32
+# Cache of interleaved copies of w1/b1, keyed by the original tensor's id().
+# w1/b1 are static expert-weight parameters reused unchanged across forward
+# calls, so repacking once and caching avoids repeating the (cheap but
+# non-trivial) interleave on every call.
+_xpu_interleaved_weight_cache: Dict[int, torch.Tensor] = {}
+
+
+def _get_xpu_interleaved_weight(w: torch.Tensor) -> torch.Tensor:
+    cached = _xpu_interleaved_weight_cache.get(id(w))
+    if cached is not None and cached.shape == w.shape:
+        return cached
+    from sgl_kernel import interleave_gate_up_weights_xe20
+
+    interleaved = interleave_gate_up_weights_xe20(w)
+    _xpu_interleaved_weight_cache[id(w)] = interleaved
+    return interleaved
+
+
 @register_custom_op(mutates_args=["hidden_states"])
 def inplace_fused_experts(
     hidden_states: torch.Tensor,
@@ -1135,6 +1163,31 @@ def fused_moe(
         topk_weight, topk_ids, _ = topk_output
         from sgl_kernel import fused_experts as sgl_fused_experts
 
+        # Opt-in to sgl-kernel-xpu's single-accumulator interleaved SwiGLU
+        # fusion for GEMM1 (design.md / moe_interleaved_fusion.md): a net win
+        # for prefill-shaped work (avg tokens/expert >= 32) at plain
+        # silu/gelu + unquantized BF16, a net loss for decode. Weights are
+        # interleaved once and cached since w1/b1 are static parameters.
+        num_experts = w1.shape[0]
+        avg_m = (hidden_states.shape[0] * topk_weight.shape[1]) // max(
+            num_experts, 1
+        )
+        use_interleaved_fuse = (
+            _XPU_MOE_INTERLEAVED_FUSE_ENABLED
+            and avg_m >= _XPU_MOE_INTERLEAVED_FUSE_MIN_AVG_M
+            and moe_runner_config.activation in ("silu", "gelu")
+            and not use_fp8_w8a8
+            and block_shape is None
+            and w1_zp is None
+            and w2_zp is None
+            and hidden_states.dtype == torch.bfloat16
+            and w1.dtype == torch.bfloat16
+        )
+        if use_interleaved_fuse:
+            w1 = _get_xpu_interleaved_weight(w1)
+            if b1 is not None:
+                b1 = _get_xpu_interleaved_weight(b1)
+
         return sgl_fused_experts(
             hidden_states,
             w1,
@@ -1159,6 +1212,7 @@ def fused_moe(
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             swiglu_limit=moe_runner_config.swiglu_limit,
+            use_interleaved_fuse=use_interleaved_fuse,
         )
 
     return fused_experts(
