@@ -135,14 +135,80 @@ _XPU_MOE_INTERLEAVED_FUSE_ENABLED = get_bool_env_var(
     "SGLANG_XPU_MOE_INTERLEAVED_FUSE"
 )
 _XPU_MOE_INTERLEAVED_FUSE_MIN_AVG_M = 32
-# Cache of interleaved copies of w1/b1, keyed by the original tensor's id().
-# w1/b1 are static expert-weight parameters reused unchanged across forward
-# calls, so repacking once and caching avoids repeating the (cheap but
-# non-trivial) interleave on every call.
+# By default, once a layer's w1/b1 are interleaved we replace them in place
+# and free the original (non-interleaved) storage, so enabling the fusion
+# costs zero extra *steady-state* GPU memory: each weight only ever exists
+# in one layout at a time (see docs/moe_interleaved_fusion.md "Memory
+# design"). The trade-off is that a converted layer stays interleaved and
+# is used for *all* later batches on that layer, including decode-shaped
+# ones, where the interleaved kernel is ~4-12% slower than the
+# dual-accumulator kernel it replaces.
+#
+# Setting SGLANG_XPU_MOE_INTERLEAVED_KEEP_BOTH=1 restores the old
+# behavior of caching both layouts simultaneously (so decode keeps using
+# the original weight/kernel with zero regression), at the cost of ~+50%
+# extra memory per MoE layer for w13. Only use this if you have GPU memory
+# headroom to spare (e.g. via a lower --mem-fraction-static).
+_XPU_MOE_INTERLEAVED_KEEP_BOTH_COPIES = get_bool_env_var(
+    "SGLANG_XPU_MOE_INTERLEAVED_KEEP_BOTH"
+)
+# Cache of interleaved copies, keyed by the original tensor's id(). Only
+# populated/consulted in "keep both copies" mode; in the default
+# (in-place) mode the interleaved tensor simply *becomes* the layer's
+# weight attribute, so no separate cache is needed.
 _xpu_interleaved_weight_cache: Dict[int, torch.Tensor] = {}
 
 
-def _get_xpu_interleaved_weight(w: torch.Tensor) -> torch.Tensor:
+def _get_xpu_interleaved_weight(
+    module: torch.nn.Module, attr_name: str
+) -> torch.Tensor:
+    """Return the interleaved-layout version of ``module.<attr_name>``.
+
+    See the module-level comment on _XPU_MOE_INTERLEAVED_KEEP_BOTH_COPIES
+    for the two supported memory/perf trade-offs.
+    """
+    w = getattr(module, attr_name)
+    marker = f"_{attr_name}_xpu_interleaved"
+
+    if getattr(module, marker, False):
+        # Already converted in place (default mode): the attribute *is*
+        # the interleaved tensor now.
+        return w
+
+    if _XPU_MOE_INTERLEAVED_KEEP_BOTH_COPIES:
+        cached = _xpu_interleaved_weight_cache.get(id(w))
+        if cached is not None and cached.shape == w.shape:
+            return cached
+        from sgl_kernel import interleave_gate_up_weights_xe20
+
+        interleaved = interleave_gate_up_weights_xe20(w)
+        _xpu_interleaved_weight_cache[id(w)] = interleaved
+        return interleaved
+
+    # Default: convert once, replace the parameter in place, and drop the
+    # original so its memory can be reclaimed. Bounds the transient extra
+    # memory during conversion to a single weight tensor (~1 layer), and
+    # leaves steady-state memory unchanged vs. the fusion being disabled.
+    from sgl_kernel import interleave_gate_up_weights_xe20
+
+    interleaved = interleave_gate_up_weights_xe20(w)
+    if isinstance(w, torch.nn.Parameter):
+        interleaved = torch.nn.Parameter(interleaved, requires_grad=False)
+    setattr(module, attr_name, interleaved)
+    setattr(module, marker, True)
+    del w
+    return interleaved
+
+
+def _get_xpu_interleaved_weight_cached(w: torch.Tensor) -> torch.Tensor:
+    """Cache-by-id variant used by the legacy standalone fused_moe()
+    below, which only receives bare tensors (no owning module/attr name),
+    so it cannot do the in-place-replace-and-free trick that the main
+    (unquant.py) integration uses. This always keeps both the original
+    and interleaved copies in memory -- acceptable here since this path
+    is only used by a handful of older models (dbrx, xverse_moe, afmoe,
+    deepseek fallback), not by Qwen3MoE.
+    """
     cached = _xpu_interleaved_weight_cache.get(id(w))
     if cached is not None and cached.shape == w.shape:
         return cached
@@ -1184,9 +1250,9 @@ def fused_moe(
             and w1.dtype == torch.bfloat16
         )
         if use_interleaved_fuse:
-            w1 = _get_xpu_interleaved_weight(w1)
+            w1 = _get_xpu_interleaved_weight_cached(w1)
             if b1 is not None:
-                b1 = _get_xpu_interleaved_weight(b1)
+                b1 = _get_xpu_interleaved_weight_cached(b1)
 
         return sgl_fused_experts(
             hidden_states,

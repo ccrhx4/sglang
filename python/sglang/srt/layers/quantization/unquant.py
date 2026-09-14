@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     _XPU_MOE_INTERLEAVED_FUSE_ENABLED,
     _XPU_MOE_INTERLEAVED_FUSE_MIN_AVG_M,
+    _XPU_MOE_INTERLEAVED_KEEP_BOTH_COPIES,
     _get_xpu_interleaved_weight,
 )
 from sglang.srt.layers.moe.utils import xpu_moe_ld_padding_elems
@@ -1210,19 +1211,34 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             # work (avg tokens/expert >= 32) at plain silu/gelu +
             # unquantized BF16, a net loss for decode-shaped work, so it's
             # opt-in via SGLANG_XPU_MOE_INTERLEAVED_FUSE and gated on shape.
+            #
+            # By default, once a layer is converted to the interleaved
+            # layout it stays that way (the original, non-interleaved
+            # weight is freed -- see _get_xpu_interleaved_weight), so we
+            # must keep using the interleaved kernel for *all* subsequent
+            # batches on that layer, even decode-shaped ones, since the
+            # non-interleaved weight/kernel is no longer available. This
+            # is what makes the fusion memory-neutral: only
+            # SGLANG_XPU_MOE_INTERLEAVED_KEEP_BOTH=1 keeps both layouts
+            # around, in which case decode can keep using the original
+            # (faster-for-decode) path as before.
+            already_interleaved = (
+                not _XPU_MOE_INTERLEAVED_KEEP_BOTH_COPIES
+                and getattr(layer, "_w13_weight_xpu_interleaved", False)
+            )
             num_experts = w1.shape[0]
             avg_m = (x.shape[0] * topk_weights.shape[1]) // max(num_experts, 1)
             use_interleaved_fuse = (
                 _XPU_MOE_INTERLEAVED_FUSE_ENABLED
-                and avg_m >= _XPU_MOE_INTERLEAVED_FUSE_MIN_AVG_M
+                and (already_interleaved or avg_m >= _XPU_MOE_INTERLEAVED_FUSE_MIN_AVG_M)
                 and moe_runner_config.activation in ("silu", "gelu")
                 and x.dtype == torch.bfloat16
                 and w1.dtype == torch.bfloat16
             )
             if use_interleaved_fuse:
-                w1 = _get_xpu_interleaved_weight(w1)
+                w1 = _get_xpu_interleaved_weight(layer, "w13_weight")
                 if b1 is not None:
-                    b1 = _get_xpu_interleaved_weight(b1)
+                    b1 = _get_xpu_interleaved_weight(layer, "w13_weight_bias")
 
             output = fused_experts(
                 x,
